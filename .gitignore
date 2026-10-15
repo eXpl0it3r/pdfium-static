@@ -1,0 +1,13 @@
+# CMake build directories
+build/
+out/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+
+# Local checkout of the build scripts, PDFium sources and staged packages
+pdfium-binaries/
+staging/

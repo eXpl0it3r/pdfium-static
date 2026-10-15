@@ -1,0 +1,285 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: PDFium branch, e.g. chromium/7390 (empty = branch of the latest Chrome release)
+        required: false
+        default: ""
+      version:
+        description: PDFium version, e.g. 142.0.7390.0 (only used when branch is set)
+        required: false
+        default: ""
+      target_cpu:
+        description: Target CPUs, space separated (x64, x86, arm64)
+        required: false
+        default: x64 x86
+      config:
+        description: Configuration
+        type: choice
+        default: both
+        options:
+          - release
+          - debug
+          - both
+      release:
+        description: Attach the packages to a GitHub release (chromium/* branches only)
+        type: boolean
+        required: false
+        default: true
+      binaries_ref:
+        description: Commit of bblanchon/pdfium-binaries to take the build scripts from
+        required: false
+        default: 5b4d6b2ede1c1b0e17f5dc7b996c42d68d534ca8
+
+# Builds aren't cancelled, since a later dispatch for another CPU or the
+# debug libraries would otherwise kill a build that's about to be released
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  init:
+    name: Initialize
+    runs-on: ubuntu-26.04
+    outputs:
+      branch: ${{ steps.resolve.outputs.branch }}
+      version: ${{ steps.resolve.outputs.version }}
+      platforms: ${{ steps.resolve.outputs.platforms }}
+    steps:
+      - name: Resolve branch, version and platforms
+        id: resolve
+        run: |
+          if [ -z "$BRANCH" ]; then
+            VERSION=$(git ls-remote --sort version:refname --tags https://chromium.googlesource.com/chromium/src '*.*.*.0' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.0' | tail -n1)
+            BRANCH="chromium/$(echo "$VERSION" | cut -d. -f3)"
+          fi
+
+          # windows-2022 on purpose, PDFium gets built against the VS 2022
+          # STL, so the libraries work with VS 2022 and VS 2026 projects
+          CPUS=$TARGET_CPU
+          if [ -z "${CPUS// /}" ]; then
+            echo "::error::No target CPU given"
+            exit 1
+          fi
+          for CPU in $CPUS; do
+            if [[ ! "$CPU" =~ ^(x64|x86|arm64)$ ]]; then
+              echo "::error::Unknown CPU '$CPU', use x64, x86 or arm64"
+              exit 1
+            fi
+          done
+          DEBUGS=$(case "$CONFIG" in release) echo false ;; debug) echo true ;; both) echo "false true" ;; esac)
+          PLATFORMS=$(for CPU in $CPUS; do
+            for DEBUG in $DEBUGS; do
+              jq -n --arg cpu "$CPU" --argjson debug "$DEBUG" '
+                (if $debug then "MTd" else "MT" end) as $crt |
+                {
+                  name: "Windows \($cpu) \($crt)",
+                  os: "windows-2022",
+                  cpu: $cpu,
+                  debug: $debug,
+                  artifact: "pdfium-win-\($cpu)-static-\($crt | ascii_downcase)"
+                }'
+            done
+          done | jq -c -s .)
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "Building \`$BRANCH\` (version \`${VERSION:-unset}\`) for $CPUS ($CONFIG)" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          BRANCH: ${{ inputs.branch }}
+          VERSION: ${{ inputs.version }}
+          TARGET_CPU: ${{ inputs.target_cpu }}
+          CONFIG: ${{ inputs.config }}
+
+  build:
+    name: ${{ matrix.platform.name }}
+    needs: init
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.init.outputs.platforms) }}
+    env:
+      PDFium_BRANCH: ${{ needs.init.outputs.branch }}
+      PDFium_VERSION: ${{ needs.init.outputs.version }}
+      PDFium_TARGET_OS: win
+      PDFium_TARGET_CPU: ${{ matrix.platform.cpu }}
+      PDFium_BUILD_TYPE: static
+      PDFium_ENABLE_V8: false
+      PDFium_IS_DEBUG: ${{ matrix.platform.debug }}
+      ARTIFACT: ${{ matrix.platform.artifact }}
+    # Job defaults replace the workflow defaults, so the shell has to be
+    # repeated here, otherwise Windows falls back to pwsh
+    defaults:
+      run:
+        shell: bash
+        working-directory: pdfium-binaries
+    steps:
+      - name: Enable long paths
+        working-directory: .
+        run: git config --system core.longpaths true
+
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout pdfium-binaries
+        uses: actions/checkout@v7
+        with:
+          repository: bblanchon/pdfium-binaries
+          ref: ${{ inputs.binaries_ref }}
+          path: pdfium-binaries
+          persist-credentials: false
+
+      - name: Set environment variables
+        run: steps/00-environment.sh
+
+      - name: Install (1/2)
+        run: steps/01-install.sh
+
+      - name: Checkout PDFium
+        run: steps/02-checkout.sh
+        timeout-minutes: 30
+
+      - name: Apply patches
+        run: |
+          steps/03-patch.sh
+
+          # PDFium's allocators reject the container proxy, which MSVC's STL
+          # allocates with iterator debugging enabled
+          if [ "$PDFium_IS_DEBUG" == "true" ]; then
+            patch --verbose -p1 -d "$PDFium_SOURCE_DIR" -i "$GITHUB_WORKSPACE/patches/iterator_debugging.patch"
+          fi
+
+      - name: Install (2/2)
+        run: steps/04-install-extras.sh
+
+      - name: Configure
+        run: |
+          steps/05-configure.sh
+
+          # Chromium turns off iterator debugging for debug builds, which
+          # makes the library unusable from a regular MSVC Debug build
+          # (_ITERATOR_DEBUG_LEVEL mismatch).
+          if [ "$PDFium_IS_DEBUG" == "true" ]; then
+            echo "enable_iterator_debugging = true" >> "$PDFium_BUILD_DIR/args.gn"
+            (cd "$PDFium_SOURCE_DIR" && gn gen "$PDFium_BUILD_DIR")
+          fi
+
+          cat <<END >>"$GITHUB_STEP_SUMMARY"
+          ## args.gn
+
+          \`\`\`gn
+          $(cat "$PDFium_BUILD_DIR/args.gn")
+          \`\`\`
+          END
+
+      - name: Build
+        run: steps/06-build.sh
+
+      - name: Stage
+        run: |
+          steps/07-stage.sh
+
+          # 07-stage.sh has no win-static case (it lists win-shared twice)
+          if [ ! -f staging/lib/pdfium.lib ]; then
+            cp "$PDFium_BUILD_DIR/obj/pdfium.lib" staging/lib/
+          fi
+          ls -la staging/lib
+
+      - name: Collect licenses
+        run: |
+          steps/08-licenses.sh
+
+          # 08-licenses.sh doesn't know libyuv yet
+          if [ -f "$PDFium_SOURCE_DIR/third_party/libyuv/LICENSE" ] && [ ! -f staging/licenses/libyuv.txt ]; then
+            cp "$PDFium_SOURCE_DIR/third_party/libyuv/LICENSE" staging/licenses/libyuv.txt
+          fi
+
+      - name: Test
+        run: |
+          case "$PDFium_TARGET_CPU" in
+            x64)   ARCH=x64;   CAN_RUN=true ;;
+            x86)   ARCH=Win32; CAN_RUN=true ;;
+            arm64) ARCH=ARM64; CAN_RUN=false ;;
+          esac
+          CONFIG=$([ "$PDFium_IS_DEBUG" == "true" ] && echo Debug || echo Release)
+
+          export PDFium_DIR="$PWD/staging"
+          cmake -S ../test -B build -G "Visual Studio 17 2022" -A "$ARCH"
+          cmake --build build --config "$CONFIG"
+
+          if [ "$CAN_RUN" == "true" ]; then
+            "build/$CONFIG/pdfium_test.exe" "$PDFium_SOURCE_DIR/testing/resources/hello_world.pdf"
+          fi
+
+      - name: Package
+        run: |
+          cd staging
+          7z a -tzip "$GITHUB_WORKSPACE/$ARTIFACT.zip" ./*
+
+      # Uploaded as is, so the release job gets the finished zip and doesn't
+      # have to guess how download-artifact laid out the directories
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.ARTIFACT }}.zip
+          archive: false
+
+  release:
+    name: Release
+    needs: [init, build]
+    if: inputs.release && startsWith(needs.init.outputs.branch, 'chromium/')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write # Create releases and upload assets
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: ${{ needs.init.outputs.branch }}
+      VERSION: ${{ needs.init.outputs.version }}
+      BINARIES_REF: ${{ inputs.binaries_ref }}
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pdfium-win-*
+          path: packages
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: List packages
+        run: |
+          ls -la packages
+          compgen -G "packages/*.zip" > /dev/null
+
+      - name: Create or update release
+        run: |
+          TAG="$BRANCH"
+
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            cat > notes.md <<END
+          Static PDFium libraries for Windows, built from \`$BRANCH\` with the static MSVC runtime (\`/MT\`, \`/MTd\` for debug builds).
+
+          Build scripts from [bblanchon/pdfium-binaries@${BINARIES_REF:0:7}](https://github.com/bblanchon/pdfium-binaries/tree/$BINARIES_REF).
+          END
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "PDFium ${VERSION:-$BRANCH}" \
+              --notes-file notes.md
+          fi
+
+          gh release upload "$TAG" packages/*.zip --clobber
+          echo "Packages attached to $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
