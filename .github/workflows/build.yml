@@ -31,7 +31,7 @@ on:
       binaries_ref:
         description: Commit of bblanchon/pdfium-binaries to take the build scripts from
         required: false
-        default: 5b4d6b2ede1c1b0e17f5dc7b996c42d68d534ca8
+        default: 83c18af693945b735503665259b728ba7d409fd0
 
 # Builds aren't cancelled, since a later dispatch for another CPU or the
 # debug libraries would otherwise kill a build that's about to be released
@@ -204,10 +204,12 @@ jobs:
         run: |
           steps/08-licenses.sh
 
-          # 08-licenses.sh doesn't know libyuv yet
-          if [ -f "$PDFium_SOURCE_DIR/third_party/libyuv/LICENSE" ] && [ ! -f staging/licenses/libyuv.txt ]; then
-            cp "$PDFium_SOURCE_DIR/third_party/libyuv/LICENSE" staging/licenses/libyuv.txt
-          fi
+          # 08-licenses.sh doesn't know brotli and libyuv yet
+          for LIBRARY in brotli libyuv; do
+            if [ -f "$PDFium_SOURCE_DIR/third_party/$LIBRARY/LICENSE" ] && [ ! -f "staging/licenses/$LIBRARY.txt" ]; then
+              cp "$PDFium_SOURCE_DIR/third_party/$LIBRARY/LICENSE" "staging/licenses/$LIBRARY.txt"
+            fi
+          done
 
       - name: Test
         run: |
