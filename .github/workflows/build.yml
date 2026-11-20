@@ -158,9 +158,10 @@ jobs:
           steps/03-patch.sh
 
           # PDFium's allocators reject the container proxy, which MSVC's STL
-          # allocates with iterator debugging enabled
+          # allocates with iterator debugging enabled. No fuzz, so the patch
+          # fails here instead of landing in the wrong spot.
           if [ "$PDFium_IS_DEBUG" == "true" ]; then
-            patch --verbose -p1 -d "$PDFium_SOURCE_DIR" -i "$GITHUB_WORKSPACE/patches/iterator_debugging.patch"
+            patch --verbose --fuzz=0 -p1 -d "$PDFium_SOURCE_DIR" -i "$GITHUB_WORKSPACE/patches/iterator_debugging.patch"
           fi
 
       - name: Install (2/2)

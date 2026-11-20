@@ -8,16 +8,17 @@
  #include <type_traits>
  #include <utility>
  
-@@ -27,6 +28,12 @@
-   template <>                          \
-   struct IsFXDataPartitionException<T> : std::true_type {}
+@@ -20,6 +21,13 @@
+ template <typename T>
+ struct IsFXDataPartitionException : std::false_type {};
  
 +// MSVC's STL allocates a std::_Container_proxy through the container's
 +// allocator when iterator debugging is enabled.
 +#if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL != 0
-+FX_DATA_PARTITION_EXCEPTION(std::_Container_proxy);
++template <>
++struct IsFXDataPartitionException<std::_Container_proxy> : std::true_type {};
 +#endif
 +
- // Allocators for mapping STL containers onto Partition Alloc.
- // Otherwise, replacing e.g. the FX_AllocUninit/FX_Free pairs with STL may
- // undo some of the nice segregation that we get from PartitionAlloc.
+ // Use ONLY for external / third-party types (e.g. Skia, Apple CoreGraphics)
+ // whose definitions cannot include `kIsDataPartitionSafe`.
+ #define FX_EXTERNAL_DATA_PARTITION_SAFE(T) \
